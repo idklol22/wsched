@@ -2,6 +2,7 @@
 daemon.pid
 daemon.log
 runner.log
+.runner_local.json
 
 # Python cache
 __pycache__/
