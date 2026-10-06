@@ -1,0 +1,9 @@
+# Local runtime logs and process ID
+daemon.pid
+daemon.log
+runner.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
