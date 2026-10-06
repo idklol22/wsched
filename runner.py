@@ -7,7 +7,7 @@ import random
 import shutil
 import signal
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 
 RUNNER_DIR = os.path.dirname(os.path.abspath(__file__))
 STAGES_DIR = os.path.join(RUNNER_DIR, "stages")
@@ -84,13 +84,109 @@ def kill_pid(pid):
     except Exception:
         return False
 
+def run_git(repo_dir, args):
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    res = subprocess.run(["git"] + args, cwd=repo_dir, capture_output=True, text=True, env=env)
+    return res.returncode, res.stdout.strip(), res.stderr.strip()
+
+def get_current_branch(repo_dir):
+    _, out, _ = run_git(repo_dir, ["rev-parse", "--abbrev-ref", "HEAD"])
+    return out if out else "main"
+
+def sync_wsched_repo(push=False, commit_msg=None):
+    """Sync state.json to/from GitHub wsched repository across operating systems."""
+    if not os.path.isdir(os.path.join(RUNNER_DIR, ".git")):
+        return
+    rc, remotes, _ = run_git(RUNNER_DIR, ["remote"])
+    if rc != 0 or "origin" not in remotes:
+        return
+
+    branch = get_current_branch(RUNNER_DIR)
+    # Pull latest updates (e.g. state pushed from another OS)
+    run_git(RUNNER_DIR, ["pull", "--ff-only", "origin", branch])
+
+    if push:
+        rc, st, _ = run_git(RUNNER_DIR, ["status", "--porcelain", "state.json"])
+        if rc == 0 and st:
+            run_git(RUNNER_DIR, ["add", "state.json"])
+            msg = commit_msg or "update scheduler state across OSs"
+            run_git(RUNNER_DIR, ["commit", "-m", msg])
+            rc_push, _, err = run_git(RUNNER_DIR, ["push", "origin", branch])
+            if rc_push == 0:
+                log("Synced state.json to GitHub wsched repository.")
+            else:
+                log(f"Notice: wsched state push: {err}")
+
+def get_target_epoch(state):
+    """Retrieve target commit time as Unix epoch seconds (timezone-independent)."""
+    epoch = state.get("next_commit_epoch")
+    if epoch is not None:
+        try:
+            return float(epoch)
+        except (ValueError, TypeError):
+            pass
+
+    # Fallback to ISO UTC string
+    utc_str = state.get("next_commit_utc")
+    if utc_str:
+        try:
+            dt = datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
+            return dt.timestamp()
+        except Exception:
+            pass
+
+    # Fallback to legacy next_commit_time string
+    time_str = state.get("next_commit_time")
+    if time_str:
+        try:
+            dt = datetime.fromisoformat(time_str)
+            return dt.timestamp()
+        except Exception:
+            pass
+        try:
+            dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+            return dt.timestamp()
+        except Exception:
+            pass
+
+    return None
+
+def format_time_left(diff_seconds):
+    """Format remaining duration nicely."""
+    if diff_seconds <= 0:
+        return "DUE NOW (scheduled time reached)"
+    diff_int = int(diff_seconds)
+    hours = diff_int // 3600
+    mins = (diff_int % 3600) // 60
+    secs = diff_int % 60
+    parts = []
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if mins > 0 or hours > 0:
+        parts.append(f"{mins}m")
+    parts.append(f"{secs}s")
+    return f"{' '.join(parts)} ({diff_seconds / 60.0:.1f} mins remaining)"
+
+def set_next_schedule(state, delay_mins, base_epoch=None):
+    """Set next commit timestamp using epoch seconds, UTC, and local time."""
+    base = base_epoch if base_epoch is not None else time.time()
+    target_epoch = base + (delay_mins * 60)
+    dt_utc = datetime.fromtimestamp(target_epoch, timezone.utc)
+    dt_loc = datetime.fromtimestamp(target_epoch).astimezone()
+
+    state["next_commit_epoch"] = round(target_epoch, 1)
+    state["next_commit_utc"] = dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    state["next_commit_local"] = dt_loc.strftime("%Y-%m-%d %H:%M:%S %Z")
+    state["next_commit_time"] = dt_loc.strftime("%Y-%m-%d %H:%M:%S")
+    return target_epoch
+
 def detect_repo(preferred=None):
     if preferred and os.path.isdir(os.path.join(preferred, ".git")):
         return os.path.abspath(preferred)
 
     parent_dir = os.path.dirname(RUNNER_DIR)
 
-    # Search subdirectories of parent_dir for a git repository
     try:
         entries = sorted(os.listdir(parent_dir))
         sorted_entries = sorted(entries, key=lambda x: (not (x.startswith("m26") or "project" in x), x))
@@ -101,11 +197,9 @@ def detect_repo(preferred=None):
     except Exception:
         pass
 
-    # Check parent_dir itself
     if os.path.isdir(os.path.join(parent_dir, ".git")):
         return os.path.abspath(parent_dir)
 
-    # Check current working directory
     cwd = os.path.abspath(os.getcwd())
     if os.path.isdir(os.path.join(cwd, ".git")):
         return cwd
@@ -123,7 +217,6 @@ def ensure_target_repo(state):
         save_state(state)
         return detected
 
-    # Auto-clone target repo if missing on new machine/OS
     remote_url = state.get("remote_url", "https://code.iiit.ac.in/osn/m26-mp2-2026121004.git")
     if remote_url:
         parent_dir = os.path.dirname(RUNNER_DIR)
@@ -144,36 +237,46 @@ def ensure_target_repo(state):
     return None
 
 def sync_state_from_git(repo_dir, state):
+    """Sync state against remote git history using commit epoch timestamps."""
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
         return state
 
-    # Pull latest from origin if possible
     branch = get_current_branch(repo_dir)
     run_git(repo_dir, ["pull", "--ff-only", "origin", branch])
 
-    # Inspect git log
-    rc, out, _ = run_git(repo_dir, ["log", "--format=%s|%h|%aI", "-n", "50"])
+    # %s = subject, %h = short hash, %ct = commit timestamp (epoch seconds), %cI = strict ISO timestamp
+    rc, out, _ = run_git(repo_dir, ["log", "--format=%s|%h|%ct|%cI", "-n", "50"])
     if rc != 0 or not out:
         return state
 
     committed_msgs = {}
     for line in out.splitlines():
-        parts = line.strip().split("|", 2)
-        if len(parts) == 3:
-            msg, c_hash, ts = parts
-            committed_msgs[msg.strip()] = (c_hash.strip(), ts.strip())
+        parts = line.strip().split("|", 3)
+        if len(parts) == 4:
+            msg, c_hash, c_epoch, c_iso = parts
+            try:
+                ep = int(c_epoch.strip())
+            except ValueError:
+                ep = int(time.time())
+            committed_msgs[msg.strip()] = (c_hash.strip(), ep, c_iso.strip())
 
     highest_stage = 0
+    highest_epoch = 0
     completed_stages = []
     for s_idx, s_msg in STAGE_COMMITS:
         if s_msg in committed_msgs:
             highest_stage = s_idx
-            c_hash, ts = committed_msgs[s_msg]
+            c_hash, c_epoch, c_iso = committed_msgs[s_msg]
+            if c_epoch > highest_epoch:
+                highest_epoch = c_epoch
+            dt_utc = datetime.fromtimestamp(c_epoch, timezone.utc)
             completed_stages.append({
                 "stage": s_idx,
                 "commit_msg": s_msg,
                 "hash": c_hash,
-                "timestamp": ts
+                "timestamp_epoch": c_epoch,
+                "timestamp_utc": dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "timestamp_local": c_iso
             })
 
     if highest_stage > state.get("current_stage", 0):
@@ -182,11 +285,14 @@ def sync_state_from_git(repo_dir, state):
         state["completed"] = completed_stages
         if highest_stage < len(STAGE_COMMITS):
             delay_mins = schedule_next_delay()
-            nxt_dt = datetime.now() + timedelta(minutes=delay_mins)
-            state["next_commit_time"] = nxt_dt.strftime("%Y-%m-%d %H:%M:%S")
+            set_next_schedule(state, delay_mins, highest_epoch)
         else:
+            state["next_commit_epoch"] = None
+            state["next_commit_utc"] = None
+            state["next_commit_local"] = None
             state["next_commit_time"] = None
         save_state(state)
+        sync_wsched_repo(push=True, commit_msg=f"sync state from git log: stage {highest_stage}")
 
     return state
 
@@ -196,6 +302,9 @@ def load_state():
         "repo_dir": "",
         "remote_url": "https://code.iiit.ac.in/osn/m26-mp2-2026121004.git",
         "branch": "main",
+        "next_commit_epoch": None,
+        "next_commit_utc": None,
+        "next_commit_local": None,
         "next_commit_time": None,
         "completed": []
     }
@@ -247,16 +356,6 @@ def apply_stage(stage_idx, repo_dir):
             dest_f = os.path.join(dest_root, f)
             shutil.copy2(src_f, dest_f)
 
-def run_git(repo_dir, args):
-    env = os.environ.copy()
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    res = subprocess.run(["git"] + args, cwd=repo_dir, capture_output=True, text=True, env=env)
-    return res.returncode, res.stdout.strip(), res.stderr.strip()
-
-def get_current_branch(repo_dir):
-    _, out, _ = run_git(repo_dir, ["rev-parse", "--abbrev-ref", "HEAD"])
-    return out if out else "main"
-
 def do_commit_stage(repo_dir, stage_idx, commit_msg):
     log(f"--- Applying Stage {stage_idx:02d}: {commit_msg} ---")
     apply_stage(stage_idx, repo_dir)
@@ -298,31 +397,39 @@ def schedule_next_delay():
     return random.randint(180, 215)
 
 def cmd_status():
+    sync_wsched_repo(push=False)
     state = load_state()
     curr = state.get("current_stage", 0)
     pid = get_daemon_pid()
     running = is_pid_alive(pid) if pid else False
     daemon_str = f"RUNNING (PID: {pid})" if running else "STOPPED"
 
-    print("=" * 60)
+    print("=" * 64)
     print("AUTOMATED COMMIT RUNNER STATUS")
-    print("=" * 60)
-    print(f"Daemon Process:  {daemon_str}")
-    print(f"Target Repo:     {state.get('repo_dir', 'Not configured')}")
-    print(f"Current Stage:   {curr} / {len(STAGE_COMMITS)}")
+    print("=" * 64)
+    print(f"Daemon Process:   {daemon_str}")
+    print(f"Target Repo:      {state.get('repo_dir', 'Not configured')}")
+    print(f"Current Stage:    {curr} / {len(STAGE_COMMITS)}")
     if curr > 0 and curr <= len(STAGE_COMMITS):
-        print(f"Last Completed:  Stage {curr}: {STAGE_COMMITS[curr - 1][1]}")
+        print(f"Last Completed:   Stage {curr}: {STAGE_COMMITS[curr - 1][1]}")
     if curr < len(STAGE_COMMITS):
         next_s = STAGE_COMMITS[curr]
-        print(f"Next Stage:      Stage {next_s[0]}: {next_s[1]}")
-        nxt_time = state.get("next_commit_time")
-        if nxt_time:
-            print(f"Scheduled At:    {nxt_time}")
+        print(f"Next Stage:       Stage {next_s[0]}: {next_s[1]}")
+        
+        target_epoch = get_target_epoch(state)
+        if target_epoch is not None:
+            time_left = target_epoch - time.time()
+            dt_utc = datetime.fromtimestamp(target_epoch, timezone.utc)
+            dt_loc = datetime.fromtimestamp(target_epoch).astimezone()
+            print(f"Time Remaining:   {format_time_left(time_left)}")
+            print(f"Scheduled (UTC):  {dt_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            print(f"Scheduled (Local):{dt_loc.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     else:
-        print("Status:          ALL STAGES COMPLETED!")
-    print("=" * 60)
+        print("Status:           ALL STAGES COMPLETED!")
+    print("=" * 64)
 
 def cmd_next(repo_dir=None):
+    sync_wsched_repo(push=False)
     state = load_state()
     if not repo_dir:
         repo_dir = state.get("repo_dir") or ensure_target_repo(state)
@@ -339,24 +446,36 @@ def cmd_next(repo_dir=None):
     stage_idx, msg = STAGE_COMMITS[curr]
     success, c_hash = do_commit_stage(repo_dir, stage_idx, msg)
     if success:
+        now_epoch = time.time()
+        dt_utc = datetime.now(timezone.utc)
+        dt_loc = datetime.now().astimezone()
+
         state["current_stage"] = curr + 1
         state["completed"].append({
             "stage": stage_idx,
             "commit_msg": msg,
             "hash": c_hash,
-            "timestamp": datetime.now().isoformat()
+            "timestamp_epoch": round(now_epoch, 1),
+            "timestamp_utc": dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "timestamp_local": dt_loc.strftime("%Y-%m-%d %H:%M:%S %Z")
         })
+
         if state["current_stage"] < len(STAGE_COMMITS):
             delay_mins = schedule_next_delay()
-            nxt_dt = datetime.now() + timedelta(minutes=delay_mins)
-            state["next_commit_time"] = nxt_dt.strftime("%Y-%m-%d %H:%M:%S")
-            log(f"Next commit (Stage {state['current_stage'] + 1}) scheduled at: {state['next_commit_time']} (in {delay_mins} mins)")
+            target_epoch = set_next_schedule(state, delay_mins, now_epoch)
+            log(f"Next commit (Stage {state['current_stage'] + 1}) scheduled at: {state['next_commit_local']} ({state['next_commit_utc']}) (in {delay_mins} mins)")
         else:
+            state["next_commit_epoch"] = None
+            state["next_commit_utc"] = None
+            state["next_commit_local"] = None
             state["next_commit_time"] = None
             log("All project commits completed!")
+
         save_state(state)
+        sync_wsched_repo(push=True, commit_msg=f"update state: stage {state['current_stage']} ({msg}) pushed")
 
 def cmd_run(repo_dir=None):
+    sync_wsched_repo(push=False)
     state = load_state()
     if not repo_dir:
         repo_dir = state.get("repo_dir") or ensure_target_repo(state)
@@ -377,28 +496,25 @@ def cmd_run(repo_dir=None):
     last_log_time = 0
     while state.get("current_stage", 0) < len(STAGE_COMMITS):
         state = load_state()
-        nxt_time_str = state.get("next_commit_time")
-        if not nxt_time_str:
+        target_epoch = get_target_epoch(state)
+        if target_epoch is None:
             delay_mins = schedule_next_delay()
-            nxt_dt = datetime.now() + timedelta(minutes=delay_mins)
-            state["next_commit_time"] = nxt_dt.strftime("%Y-%m-%d %H:%M:%S")
+            target_epoch = set_next_schedule(state, delay_mins)
             save_state(state)
-            nxt_time_str = state["next_commit_time"]
+            sync_wsched_repo(push=True)
 
-        nxt_dt = datetime.strptime(nxt_time_str, "%Y-%m-%d %H:%M:%S")
-        now = datetime.now()
+        now_epoch = time.time()
+        time_left = target_epoch - now_epoch
 
-        if now >= nxt_dt:
-            log(f"Scheduled time reached ({nxt_time_str}). Triggering next commit...")
+        if time_left <= 0:
+            log(f"Scheduled time reached ({state.get('next_commit_utc', 'now')}). Triggering next commit...")
             cmd_next(state["repo_dir"])
             last_log_time = 0
         else:
-            wait_sec = (nxt_dt - now).total_seconds()
-            wait_min = wait_sec / 60.0
             if time.time() - last_log_time >= 1800:
-                log(f"Waiting for next commit scheduled at {nxt_time_str} (~{wait_min:.1f} minutes remaining)...")
+                log(f"Waiting for next commit scheduled at {state.get('next_commit_local')} ({state.get('next_commit_utc')}) - {format_time_left(time_left)}...")
                 last_log_time = time.time()
-            sleep_duration = min(30, max(1, wait_sec))
+            sleep_duration = min(30, max(1, time_left))
             time.sleep(sleep_duration)
 
     log("ALL 11 STAGES COMPLETED! Entire project committed and pushed successfully.")
@@ -410,7 +526,8 @@ def cmd_start(repo_dir=None):
         print("Check status: python3 runner.py status")
         return
 
-    # Check/bootstrap repo before launching daemon
+    # Check/bootstrap repo and pull latest wsched state before launching daemon
+    sync_wsched_repo(push=False)
     state = load_state()
     target = repo_dir or state.get("repo_dir") or ensure_target_repo(state)
 
@@ -484,7 +601,7 @@ if __name__ == "__main__":
         cmd_run(target_repo)
     else:
         print("Usage:")
-        print("  python3 runner.py status            # Show current progress and daemon status")
+        print("  python3 runner.py status            # Show current progress, time left, and daemon status")
         print("  python3 runner.py start [repo]      # Start daemon in background (cross-platform)")
         print("  python3 runner.py stop              # Stop running daemon")
         print("  python3 runner.py restart [repo]    # Restart running daemon")
