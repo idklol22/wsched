@@ -27,7 +27,9 @@ STAGE_COMMITS = [
     (8, "mastermind add logging with microsecond timestamps"),
     (9, "mastermind udp chunking and ack packet protocol"),
     (10, "mastermind cost cutting mode with reliable udp"),
-    (11, "update docs and final makefile polish")
+    (11, "update docs and final makefile polish"),
+    (12, "xv6 implement user-level alarms"),
+    (13, "xv6 implement copy-on-write fork")
 ]
 
 def log(msg):
@@ -443,6 +445,13 @@ def do_commit_stage(repo_dir, stage_idx, commit_msg):
         except (FileNotFoundError, OSError):
             pass
 
+    xv6_dir = os.path.join(repo_dir, "xv6")
+    if os.path.isdir(xv6_dir):
+        try:
+            subprocess.run(["make", "-C", xv6_dir, "clean"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (FileNotFoundError, OSError):
+            pass
+
     run_git(repo_dir, ["add", "-A"])
 
     rc, out, _ = run_git(repo_dir, ["status", "--porcelain"])
@@ -469,7 +478,7 @@ def do_commit_stage(repo_dir, stage_idx, commit_msg):
     return True, c_hash
 
 def schedule_next_delay():
-    return random.randint(180, 215)
+    return 360  # 6 hours interval (360 minutes)
 
 def cmd_status(repo_dir=None):
     sync_wsched_repo(push=False)
@@ -528,7 +537,7 @@ def cmd_next(repo_dir=None):
 
     curr = state.get("current_stage", 0)
     if curr >= len(STAGE_COMMITS):
-        print("All 11 stages already committed.")
+        print(f"All {len(STAGE_COMMITS)} stages already committed.")
         return
 
     stage_idx, msg = STAGE_COMMITS[curr]
@@ -612,7 +621,7 @@ def cmd_run(repo_dir=None):
                 sleep_duration = min(30, max(1, time_left))
                 time.sleep(sleep_duration)
 
-        log("ALL 11 STAGES COMPLETED! Entire project committed and pushed successfully.")
+        log(f"ALL {len(STAGE_COMMITS)} STAGES COMPLETED! Entire project committed and pushed successfully.")
     finally:
         try:
             if get_daemon_pid() == os.getpid() and os.path.exists(PID_FILE):

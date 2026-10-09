@@ -24,7 +24,9 @@ def copy_file(src, dst):
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     shutil.copy2(src, dst)
 
-print("Building 11 stages...")
+TEMPLATES_DIR = os.environ.get("TEMPLATES_DIR", os.path.join(SCRIPT_DIR, "templates"))
+
+print("Building 13 stages...")
 
 # STAGE 1: Initial setup
 s1 = setup_stage(1, "initial setup and makefiles")
@@ -405,20 +407,61 @@ copy_file(f"{BASE_DIR}/networking/mastermind/main.c", f"{s10}/networking/masterm
 # STAGE 11: Final polish, docs, readme and ai usage
 s11 = setup_stage(11, "update docs and final makefile polish")
 shutil.copytree(s10, s11, dirs_exist_ok=True)
-copy_file(f"{BASE_DIR}/readme.md", f"{s11}/readme.md")
-copy_file(f"{BASE_DIR}/ai-usage.md", f"{s11}/ai-usage.md")
+copy_file(f"{TEMPLATES_DIR}/readme_stage11.md", f"{s11}/readme.md")
+copy_file(f"{TEMPLATES_DIR}/ai_usage_stage11.md", f"{s11}/ai-usage.md")
+
+# STAGE 12: xv6 user-level alarms
+s12 = setup_stage(12, "xv6 implement user-level alarms")
+shutil.copytree(s11, s12, dirs_exist_ok=True)
+xv6_src = os.path.join(BASE_DIR, "xv6")
+if not os.path.exists(xv6_src):
+    xv6_src = os.path.join(PROJECT_ROOT, "m26-mp2-2026121004", "xv6")
+shutil.copytree(xv6_src, f"{s12}/xv6", dirs_exist_ok=True, ignore=shutil.ignore_patterns("*.o", "*.d", "*.asm", "*.sym", "fs.img", "kernel/kernel"))
+
+# Ensure base files for non-alarm components in stage 12
+for bf in ["defs.h", "kalloc.c", "riscv.h", "vm.c"]:
+    target_bf = f"{s12}/xv6/kernel/{bf}"
+    git_res = subprocess.run(["git", "-C", os.path.join(PROJECT_ROOT, "m26-mp2-2026121004"), "show", f"HEAD:xv6/kernel/{bf}"], capture_output=True, text=True)
+    if git_res.returncode == 0 and git_res.stdout:
+        write_file(target_bf, git_res.stdout)
+
+copy_file(f"{TEMPLATES_DIR}/kernel_alarm/proc.h", f"{s12}/xv6/kernel/proc.h")
+copy_file(f"{TEMPLATES_DIR}/kernel_alarm/proc.c", f"{s12}/xv6/kernel/proc.c")
+copy_file(f"{TEMPLATES_DIR}/kernel_alarm/sysproc.c", f"{s12}/xv6/kernel/sysproc.c")
+copy_file(f"{TEMPLATES_DIR}/kernel_alarm/trap.c", f"{s12}/xv6/kernel/trap.c")
+copy_file(f"{TEMPLATES_DIR}/readme_stage12.md", f"{s12}/readme.md")
+copy_file(f"{TEMPLATES_DIR}/ai_usage_stage12.md", f"{s12}/ai-usage.md")
+
+# STAGE 13: xv6 copy-on-write fork
+s13 = setup_stage(13, "xv6 implement copy-on-write fork")
+shutil.copytree(s12, s13, dirs_exist_ok=True)
+copy_file(f"{TEMPLATES_DIR}/kernel_cow/riscv.h", f"{s13}/xv6/kernel/riscv.h")
+copy_file(f"{TEMPLATES_DIR}/kernel_cow/defs.h", f"{s13}/xv6/kernel/defs.h")
+copy_file(f"{TEMPLATES_DIR}/kernel_cow/kalloc.c", f"{s13}/xv6/kernel/kalloc.c")
+copy_file(f"{TEMPLATES_DIR}/kernel_cow/vm.c", f"{s13}/xv6/kernel/vm.c")
+copy_file(f"{TEMPLATES_DIR}/kernel_cow/trap.c", f"{s13}/xv6/kernel/trap.c")
+copy_file(f"{TEMPLATES_DIR}/readme_stage13.md", f"{s13}/readme.md")
+copy_file(f"{TEMPLATES_DIR}/ai_usage_stage13.md", f"{s13}/ai-usage.md")
 
 print("Validating compilation of each stage...")
-for i in range(1, 12):
+for i in range(1, 14):
     sdir = os.path.join(STAGES_DIR, f"stage_{i:02d}")
     netdir = os.path.join(sdir, "networking")
     res = subprocess.run(["make", "-C", netdir, "clean"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     res = subprocess.run(["make", "-C", netdir, "all"], capture_output=True, text=True)
     if res.returncode != 0:
-        print(f"FAILED STAGE {i:02d}: {res.stderr}")
+        print(f"FAILED STAGE {i:02d} networking: {res.stderr}")
         exit(1)
-    else:
-        print(f"Stage {i:02d} OK")
     subprocess.run(["make", "-C", netdir, "clean"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-print("All 11 stages generated and verified successfully!")
+    xv6dir = os.path.join(sdir, "xv6")
+    if os.path.exists(xv6dir):
+        res = subprocess.run(["make", "-C", xv6dir, "kernel/kernel"], capture_output=True, text=True)
+        if res.returncode != 0:
+            print(f"FAILED STAGE {i:02d} xv6: {res.stderr}")
+            exit(1)
+        subprocess.run(["make", "-C", xv6dir, "clean"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    print(f"Stage {i:02d} OK")
+
+print("All 13 stages generated and verified successfully!")
